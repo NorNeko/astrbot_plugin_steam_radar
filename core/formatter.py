@@ -27,7 +27,7 @@ _SCORE_EMOJI: dict[str, str] = {
 }
 
 
-def format_game_info(game: SteamGameInfo, cc: str) -> tuple[str, str | None]:
+def format_game_info(game: SteamGameInfo, cc: str, preset: str = "full") -> tuple[str, str | None]:
     """
     将 SteamGameInfo 格式化为纯文本消息。
 
@@ -38,6 +38,22 @@ def format_game_info(game: SteamGameInfo, cc: str) -> tuple[str, str | None]:
     """
     if game.error:
         return f"❌ 查询失败：{game.error}", None
+
+    if preset == "simple":
+        lines = [f"🎮 {game.name or '未知游戏'}", f"💰 {format_price_only(game, cc)}"]
+        lines.append(_format_history_low(game) if game.history_low_price is not None else "💸 史低：暂无数据")
+        if game.review_score_desc:
+            total = game.review_total_reviews
+            label = _REVIEW_LANG_LABELS.get(game.review_lang, game.review_lang)
+            score = _SCORE_EMOJI.get(game.review_score_desc, "📊")
+            if total > 0:
+                pct = round(game.review_total_positive / total * 100)
+                lines.append(f"{score} {game.review_score_desc}（{pct}% 好评 · {total:,} 条 · {label}）")
+            else:
+                lines.append(f"{score} {game.review_score_desc}（{label}）")
+        else:
+            lines.append("📊 评价：暂无数据")
+        return "\n".join(lines), game.header_image
 
     lines: list[str] = []
 

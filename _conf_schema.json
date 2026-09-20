@@ -4,21 +4,49 @@
         "hint": "查询价格时使用的地区。候选值：hk（香港）/ cn（中国大陆）/ us（美国）/ jp（日本）/ tw（台湾）/ sg（新加坡）",
         "type": "string",
         "default": "hk",
-        "options": ["hk", "cn", "us", "jp", "tw", "sg"]
+        "options": [
+            "hk",
+            "cn",
+            "us",
+            "jp",
+            "tw",
+            "sg"
+        ]
     },
     "default_lang": {
         "description": "默认语言代码",
-        "hint": "游戏信息的显示语言。schinese = 简体中文，english = 英文",
+        "hint": "游戏详情的显示语言；名称搜索始终使用简体中文，不随商店地区或此项切换。schinese = 简体中文，english = 英文",
         "type": "string",
         "default": "schinese",
-        "options": ["schinese", "english", "japanese", "koreana"]
+        "options": [
+            "schinese",
+            "english",
+            "japanese",
+            "koreana"
+        ]
     },
     "review_lang": {
         "description": "评测数据语言区",
-        "hint": "统计好评率时筛选的评测语言区。schinese=简体中文区，tchinese=繁体中文区，japanese=日语区，english=英语区，all=全部语言。可在对话中用 /steam_rlang {语言代码} 临时切换。",
+        "hint": "统计好评率时筛选的评测语言区。schinese=简体中文区，tchinese=繁体中文区，japanese=日语区，english=英语区，all=全部语言。可在对话中用 /str {语言代码} 临时切换。",
         "type": "string",
         "default": "schinese",
-        "options": ["schinese", "tchinese", "japanese", "english", "all"]
+        "options": [
+            "schinese",
+            "tchinese",
+            "japanese",
+            "english",
+            "all"
+        ]
+    },
+    "output_preset": {
+        "description": "游戏详情输出预设",
+        "hint": "full 显示完整信息；simple 仅显示游戏名、价格、史低、评价和封面图。史低需配置 ITAD API Key。",
+        "type": "string",
+        "default": "full",
+        "options": [
+            "full",
+            "simple"
+        ]
     },
     "request_timeout": {
         "description": "请求超时时间（秒）",
@@ -44,7 +72,7 @@
     },
     "proxy": {
         "description": "代理地址",
-        "hint": "例如 http://127.0.0.1:7897，留空则不使用代理。",
+        "hint": "例如 http://127.0.0.1:7897。留空时尝试环境变量代理，未设置则直连；封面图下载同样使用此设置。",
         "type": "string",
         "default": "http://127.0.0.1:7897"
     },
@@ -56,7 +84,7 @@
     },
     "enhanced_search": {
         "description": "启用增强搜索（ITAD）",
-        "hint": "开启后，当 Steam 官方搜索结果匹配度较低时，自动调用 ITAD 搜索接口进行补充搜索。需要配置上方的 itad_api_key 才能生效。开启后还会调用下方配置的 LLM 支持中文关键词搜索和结果校验。",
+        "hint": "仅当 Steam 简体中文名称搜索和适用的 AppID 查询都无结果时，使用 ITAD 补搜；配置 LLM 后可翻译中文关键词并校验补搜结果。需要 itad_api_key 才能启用。",
         "type": "bool",
         "default": false
     },
@@ -94,7 +122,11 @@
         "hint": "Off=关闭（所有人可用）；Whitelist=白名单（仅 allowed_list 内可用）；Blacklist=黑名单（banned_list 内拒绝访问）",
         "type": "string",
         "default": "Off",
-        "options": ["Off", "Whitelist", "Blacklist"]
+        "options": [
+            "Off",
+            "Whitelist",
+            "Blacklist"
+        ]
     },
     "allowed_list": {
         "description": "白名单（UMO 列表）",
@@ -161,13 +193,13 @@
     },
     "search_game_only": {
         "description": "仅显示游戏（过滤非游戏内容）",
-        "hint": "开启后，搜索结果将过滤 DLC、原声带、视频、画册等非游戏内容，仅显示完整游戏。推荐开启以避免大量同名 DLC 占据搜索结果。",
+        "hint": "开启后，搜索建议未带类型标记时会通过 Steam 详情接口核实，过滤 DLC、原声带、画册等。类型核实失败时保留候选，避免漏掉游戏。",
         "type": "bool",
         "default": true
     },
     "search_max_results": {
         "description": "搜索结果每页显示数量",
-        "hint": "/steam_search 每页最多显示的搜索结果条数，范围 1-10。超出此数量的结果可通过 #next/#prev 翻页查看。",
+        "hint": "/steam 每次搜索最多保留并展示的候选数，范围 1-10。",
         "type": "int",
         "slider": {
             "min": 1,

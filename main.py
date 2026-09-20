@@ -22,6 +22,7 @@ from .core.wishlist_manager import WishlistManager
 from .core.llm_client import LLMClient
 from .models.wishlist_models import WishlistGameCache, WishAdder, PendingNotification
 from .core import formatter
+from .core.search_router import search_mode, is_missing_appid_error
 
 if TYPE_CHECKING:
     from .models.store_models import SteamGameInfo
@@ -117,6 +118,8 @@ class SteamStoreSniperPlugin(Star):
         # 用于 /steam_search 返回多条结果后，用户通过 #N 选择指定游戏
         self._search_select_cache: dict[str, dict] = {}
         self._SEARCH_CACHE_TTL = 120.0  # 2 分钟过期
+        # Steam suggest 不稳定地提供类型标记；缓存详情接口核实的类型 1 小时。
+        self._suggest_type_cache: dict[int, tuple[str, float]] = {}
 
         # ── 群愿望单 ──
         self._wishlist = WishlistManager(data_dir=StarTools.get_data_dir())
@@ -310,10 +313,10 @@ class SteamStoreSniperPlugin(Star):
     # 指令：/steam
     # ------------------------------------------------------------------
 
-    @filter.command("steam")
+    @filter.command("steam", alias={"st"})
     async def cmd_steam(self, event: AstrMessageEvent):
-        """查询 Steam 游戏详情。用法：/steam {appid}"""
-        arg = re.sub(r"^/?steam\s*", "", event.message_str.strip(), flags=re.IGNORECASE).strip()
+        """按名称或 AppID 查询 Steam 游戏。用法：/steam {内容}"""
+        arg = re.sub(r"^/?(?:steam|st)(?=\s|$)\s*", "", event.message_str.strip(), flags=re.IGNORECASE).strip()
 
         if not await self._acl.check_access(event.unified_msg_origin):
             yield event.plain_result("权限不足：您所在的群组或账户未被授权使用此功能。")
@@ -323,38 +326,45 @@ class SteamStoreSniperPlugin(Star):
             yield event.plain_result(
                 "🎮 Steam 雷达指令列表\n\n"
                 "【基础查询】\n"
-                "  /steam {appid}                         查询游戏详情\n"
-                "  /steam {appid} {语言代码}               指定评测语言区查询\n"
-                "  /steam_price {appid} {地区}             指定地区查询价格\n"
-                "  /steam_shots {appid}                   查询游戏截图\n"
+                "  /steam {名称或 AppID}                 搜索游戏（/st 简写）\n"
+                "  /steam {appid} {语言代码}             指定评测语言区查询\n"
+                "  /stp {appid} {地区}                    指定地区查询价格\n"
+                "  /sts {appid}                          查询游戏截图\n"
                 "  发送 Steam 商店链接                     开启自动解析时自动查询\n"
                 "  /steam help                           显示此帮助\n\n"
                 "【配置管理】\n"
-                "  /steam_rlang [语言代码]                设置评测语言区（无参查看帮助）\n"
-                "  /steam_adult status [UMO]             查看 R18 截图屏蔽名单\n"
-                "  /steam_adult on [UMO]                 加入屏蔽名单\n"
-                "  /steam_adult off [UMO]                移出屏蔽名单\n\n"
+                "  /str [语言代码]                        设置评测语言区\n"
+                "  /sta status [UMO]                     查看 R18 截图屏蔽名单\n"
+                "  /sta on [UMO]                         加入屏蔽名单\n"
+                "  /sta off [UMO]                        移出屏蔽名单\n\n"
                 "【快速提示】\n"
                 "  • 评测语言：schinese | tchinese | japanese | english | all\n"
                 "  • 支持 AppID 和商店链接作为参数\n"
                 "  • 获取会话 UMO 标识：向机器人发送 /sid\n"
-                "  • /steam_rlang 仅对下一次查询生效（一次性）\n"
-                "  • /steam_adult 无参数时默认查看当前会话，附加 UMO 可远程管理其他群聊"
+                "  • /str 仅对下一次查询生效（一次性）\n"
+                "  • /sta 无参数时默认查看当前会话，附加 UMO 可远程管理其他群聊"
             )
             return
 
         # 解析可选末尾语言区参数：/steam {appid} {rlang} 或 /steam {appid}
         parts = arg.split()
         inline_rlang: str | None = None
-        if len(parts) >= 2 and parts[-1].lower() in _REVIEW_LANG_NAMES:
+        if len(parts) == 2 and re.fullmatch(r"[0-9]+", parts[0]) and parts[-1].lower() in _REVIEW_LANG_NAMES:
             inline_rlang = parts[-1].lower()
             appid_str = " ".join(parts[:-1])
         else:
             appid_str = arg
 
-        # 仅接受纯数字 AppID，URL 链接由自动解析处理器负责
-        if not re.match(r"^\d+$", appid_str):
-            yield event.plain_result("请输入 Steam AppID（纯数字）\n如需通过商店链接查询，请直接发送链接（需开启自动解析）")
+        mode = search_mode(appid_str)
+        if mode == "name" or mode == "short_numeric":
+            # 1–3 位数字先按游戏名搜索，且此轮不使用 LLM 或 ITAD。
+            # 只有没有游戏结果时才将短数字解释成 AppID。
+            async for result in self._search_by_name(
+                event, appid_str,
+                fallback_appid=(int(appid_str) if mode == "short_numeric" else None),
+                review_lang=inline_rlang,
+            ):
+                yield result
             return
         appid = int(appid_str)
 
@@ -363,6 +373,11 @@ class SteamStoreSniperPlugin(Star):
         # 优先级：内联参数 > 会话覆盖 > WebUI 全局默认
         rlang = inline_rlang if inline_rlang else self._review_lang(event.unified_msg_origin)
         game, cc = await self._query_with_fallback(appid, cc, lang, review_lang=rlang)
+        if is_missing_appid_error(game.error):
+            # 长数字先查 AppID；无此 AppID 时仍试一次中文名称搜索，最后才补搜。
+            async for result in self._search_by_name(event, appid_str, review_lang=rlang):
+                yield result
+            return
 
         # 截断简介
         if game.short_description:
@@ -370,28 +385,25 @@ class SteamStoreSniperPlugin(Star):
             if len(game.short_description) > max_len:
                 game.short_description = game.short_description[:max_len] + "..."
 
-        text, image_url = formatter.format_game_info(game, cc)
-        result = event.make_result().message(text)
-        if image_url:
-            result = result.url_image(image_url)
-        yield result
+        text, image_url = self._format_game_info(game, cc)
+        yield await self._result_with_cover(event, text, image_url)
 
     # ------------------------------------------------------------------
     # 指令：/steam_price
     # ------------------------------------------------------------------
 
-    @filter.command("steam_price")
+    @filter.command("steam_price", alias={"stp"})
     async def cmd_steam_price(self, event: AstrMessageEvent):
         """指定地区查询价格。用法：/steam_price {appid} {地区代码}"""
         if not await self._acl.check_access(event.unified_msg_origin):
             yield event.plain_result("权限不足：您所在的群组或账户未被授权使用此功能。")
             return
 
-        arg = re.sub(r"^/?steam_price\s*", "", event.message_str.strip(), flags=re.IGNORECASE).strip()
+        arg = re.sub(r"^/?(?:steam_price|stp)(?=\s|$)\s*", "", event.message_str.strip(), flags=re.IGNORECASE).strip()
         parts = arg.split()
 
         if len(parts) < 2:
-            yield event.plain_result("用法：/steam_price {appid 或商店链接} {地区代码}")
+            yield event.plain_result("用法：/stp {appid 或商店链接} {地区代码}")
             return
 
         appid = _parse_appid(parts[0])
@@ -438,24 +450,21 @@ class SteamStoreSniperPlugin(Star):
             if len(game.short_description) > max_len:
                 game.short_description = game.short_description[:max_len] + "..."
 
-        text, image_url = formatter.format_game_info(game, cc)
-        result = event.make_result().message(text)
-        if image_url:
-            result = result.url_image(image_url)
-        yield result
+        text, image_url = self._format_game_info(game, cc)
+        yield await self._result_with_cover(event, text, image_url)
 
     # ------------------------------------------------------------------
     # 正则指令：/steam_rlang {语言代码}（会话级评测语言区切换）
     # ------------------------------------------------------------------
 
-    @filter.regex(r"^/?steam_rlang(?:\s+\S+)?")
+    @filter.regex(r"^/?(?:steam_rlang|str)(?:\s+\S+)?$")
     async def cmd_set_review_lang(self, event: AstrMessageEvent):
         """切换当前会话的评测数据语言区。用法：/steam_rlang {语言代码}"""
         if not await self._acl.check_access(event.unified_msg_origin):
             yield event.plain_result("权限不足：您所在的群组或账户未被授权使用此功能。")
             return
 
-        m = re.search(r"^/?steam_rlang\s+(\S+)", event.message_str.strip(), re.IGNORECASE)
+        m = re.search(r"^/?(?:steam_rlang|str)\s+(\S+)", event.message_str.strip(), re.IGNORECASE)
         if not m:
             # 无参数时显示当前设置与帮助
             current = self._review_lang(event.unified_msg_origin)
@@ -464,7 +473,7 @@ class SteamStoreSniperPlugin(Star):
             yield event.plain_result(
                 f"当前评测数据语言区：{current_label}（{current}）\n"
                 f"可选值：{options}\n"
-                f"用法：/steam_rlang {{语言代码}}"
+                f"用法：/str {{语言代码}}"
             )
             return
 
@@ -482,7 +491,7 @@ class SteamStoreSniperPlugin(Star):
     # 正则指令：/steam_adult on|off|status [UMO]（成人内容屏蔽名单切换）
     # ------------------------------------------------------------------
 
-    @filter.regex(r"^/?steam_adult(?:\s+\S+){0,2}")
+    @filter.regex(r"^/?(?:steam_adult|sta)(?:\s+\S+){0,2}$")
     async def cmd_toggle_adult(self, event: AstrMessageEvent):
         """切换 R18 截图屏蔽名单。用法：/steam_adult on|off|status [UMO]
         可在任意会话中通过附加 UMO 参数远程管理任意群聊；省略 UMO 时默认对当前会话操作。
@@ -493,7 +502,7 @@ class SteamStoreSniperPlugin(Star):
 
         current_umo = event.unified_msg_origin or ""
         m = re.search(
-            r"^/?steam_adult(?:\s+(\S+))?(?:\s+(\S+))?",
+            r"^/?(?:steam_adult|sta)(?:\s+(\S+))?(?:\s+(\S+))?",
             event.message_str.strip(),
             re.IGNORECASE,
         )
@@ -517,20 +526,20 @@ class SteamStoreSniperPlugin(Star):
                 f"{target_line}"
                 f"屏蔽名单容量：{count}\n"
                 f"前若干条：{preview}{more}\n"
-                f"用法：/steam_adult on|off|status [UMO]\n"
+                f"用法：/sta on|off|status [UMO]\n"
                 f"  - 省略 UMO 时对当前会话操作\n"
                 f"  - 附加 UMO 可远程管理任意会话，例如：/steam_adult on aiocqhttp:GroupMessage:123456"
             )
             return
 
         if action not in {"on", "off"}:
-            yield event.plain_result("参数无效。用法：/steam_adult on|off|status [UMO]")
+            yield event.plain_result("参数无效。用法：/sta on|off|status [UMO]")
             return
 
         if not target_umo:
             yield event.plain_result(
                 "未指定目标 UMO，且当前会话 UMO 不可用。\n"
-                "用法：/steam_adult on|off {UMO}，例如 /steam_adult on aiocqhttp:GroupMessage:123456"
+                "用法：/sta on|off {UMO}，例如 /sta on aiocqhttp:GroupMessage:123456"
             )
             return
 
@@ -569,16 +578,16 @@ class SteamStoreSniperPlugin(Star):
     # 指令：/steam_shots（F2 截图预览 + F3 成人内容防护）
     # ------------------------------------------------------------------
 
-    @filter.command("steam_shots")
+    @filter.command("steam_shots", alias={"sts"})
     async def cmd_steam_shots(self, event: AstrMessageEvent):
         """查询 Steam 游戏截图。用法：/steam_shots {appid 或商店链接}"""
         if not await self._acl.check_access(event.unified_msg_origin):
             yield event.plain_result("权限不足：您所在的群组或账户未被授权使用此功能。")
             return
 
-        arg = re.sub(r"^/?steam_shots\s*", "", event.message_str.strip(), flags=re.IGNORECASE).strip()
+        arg = re.sub(r"^/?(?:steam_shots|sts)(?=\s|$)\s*", "", event.message_str.strip(), flags=re.IGNORECASE).strip()
         if not arg:
-            yield event.plain_result("用法：/steam_shots {appid 或商店链接}")
+            yield event.plain_result("用法：/sts {appid 或商店链接}")
             return
 
         appid = _parse_appid(arg)
@@ -592,18 +601,20 @@ class SteamStoreSniperPlugin(Star):
             yield event.plain_result(f"查询失败：{game.error}")
             return
 
-        # F3：成人内容防护（默认全局屏蔽，仅豁免名单内的会话允许 R18）
-        # required_age >= 18 是明确年龄门控；content_descriptor_ids 含 1/3/4 是 Steam
-        # 对性内容的描述符，两者取并集以覆盖 required_age=0 但实为成人内容的游戏
+        # F3：仅屏蔽名单内的会话拒绝成人内容截图。
+        # Steam 可能将 required_age 返回为 0，但仍通过内容描述符标记成人内容。
         _ADULT_DESCRIPTOR_IDS = {1, 3, 4}
-        is_adult = (
-            game.required_age >= 18
-            or bool(_ADULT_DESCRIPTOR_IDS & set(game.content_descriptor_ids))
-        )
+        has_adult_descriptor = bool(_ADULT_DESCRIPTOR_IDS & set(game.content_descriptor_ids))
+        is_adult = game.required_age >= 18 or has_adult_descriptor
         if is_adult and self._is_adult_blocked(event.unified_msg_origin):
+            reason = (
+                f"年龄限制 {game.required_age}+"
+                if game.required_age >= 18
+                else "按 18+ 规则屏蔽"
+            )
             yield event.plain_result(
-                f"【{game.name}】被标记为成人内容（年龄限制 {game.required_age}+），已在当前会话屏蔽截图发送。\n"
-                "如需在当前会话放行，请管理员发送 /steam_adult off 将本会话从屏蔽名单中移除。"
+                f"【{game.name}】被标记为成人内容（{reason}），已在当前会话屏蔽截图发送。\n"
+                "如需在当前会话放行，请管理员发送 /sta off 将本会话从屏蔽名单中移除。"
             )
             return
 
@@ -714,6 +725,11 @@ class SteamStoreSniperPlugin(Star):
         """检查 LLM 客户端是否可用（用于搜索校验和翻译）。"""
         return self._llm_client is not None
 
+    def _format_game_info(self, game: "SteamGameInfo", cc: str) -> tuple[str, str | None]:
+        return formatter.format_game_info(
+            game, cc, preset=str(self.config.get("output_preset", "full"))
+        )
+
     def _search_max_results(self) -> int:
         try:
             return max(1, min(10, int(self.config.get("search_max_results", 5))))
@@ -723,6 +739,45 @@ class SteamStoreSniperPlugin(Star):
     def _search_game_only(self) -> bool:
         """检查搜索结果是否仅显示游戏（过滤 DLC、原声带、视频等非游戏内容）。"""
         return bool(self.config.get("search_game_only", True))
+
+    async def _filter_search_games(self, candidates: list[dict]) -> list[dict]:
+        """核实 suggest 中无类型标记的候选；接口失败时保留以免漏报。"""
+        cache = getattr(self, "_suggest_type_cache", None)
+        if cache is None:
+            cache = self._suggest_type_cache = {}
+        semaphore = asyncio.Semaphore(3)
+
+        async def keep_if_game(item: dict) -> dict | None:
+            item_type = item.get("type", "unknown")
+            if item_type == "game":
+                return item
+            if item_type == "other":
+                return None
+            appid = item.get("appid")
+            if not appid:
+                return None
+            now = time.monotonic()
+            cached = cache.get(appid)
+            if cached and cached[1] > now:
+                actual_type = cached[0]
+            else:
+                try:
+                    async with semaphore:
+                        details = await self._client.fetch_app_details(
+                            appid, self._cc(), "schinese"
+                        )
+                    actual_type = details.get("type")
+                except SteamAPIError as e:
+                    logger.warning(f"[steam] 搜索候选 {appid} 类型核实失败，保留候选: {e}")
+                    return item
+                if actual_type:
+                    if len(cache) >= 256:
+                        cache.pop(next(iter(cache)))
+                    cache[appid] = (actual_type, now + 3600)
+            return item if actual_type in (None, "game") else None
+
+        checked = await asyncio.gather(*(keep_if_game(item) for item in candidates))
+        return [item for item in checked if item is not None]
 
     # ------------------------------------------------------------------
     # 搜索结果选择缓存（#N 选择功能）
@@ -780,8 +835,19 @@ class SteamStoreSniperPlugin(Star):
         try:
             return await self._client.download_bytes(url)
         except Exception as e:
-            logger.debug(f"[steam] 搜索封面图下载失败: {type(e).__name__}: {e}")
+            logger.warning(f"[steam] 封面图下载失败: {type(e).__name__}: {e}")
             return None
+
+    async def _result_with_cover(
+        self, event: AstrMessageEvent, text: str, image_url: str | None
+    ):
+        """先由插件下载封面；失败时仍发送游戏文字信息。"""
+        result = event.make_result().message(text)
+        if image_url:
+            image_data = await self._download_image_bytes(image_url)
+            if image_data:
+                result.base64_image(base64.b64encode(image_data).decode("ascii"))
+        return result
 
     async def _send_search_results(
         self,
@@ -848,11 +914,7 @@ class SteamStoreSniperPlugin(Star):
             if price:
                 text += f"\n     💰 {price}"
 
-            if image_url:
-                result = event.make_result().url_image(image_url).message(text)
-                yield result
-            else:
-                yield event.plain_result(text)
+            yield await self._result_with_cover(event, text, image_url)
 
         # 提示行
         hints: list[str] = []
@@ -873,91 +935,70 @@ class SteamStoreSniperPlugin(Star):
 
     @filter.command("steam_search")
     async def cmd_steam_search(self, event: AstrMessageEvent):
-        """搜索 Steam 游戏。用法：/steam_search {关键词}"""
+        """旧指令兼容入口；统一使用 /steam {名称或 AppID}。"""
         if not await self._acl.check_access(event.unified_msg_origin):
             yield event.plain_result("权限不足：您所在的群组或账户未被授权使用此功能。")
             return
-
         arg = re.sub(
-            r"^/?steam_search\s*", "", event.message_str.strip(), flags=re.IGNORECASE
+            r"^/?steam_search(?=\s|$)\s*", "", event.message_str.strip(), flags=re.IGNORECASE
         ).strip()
         if not arg:
-            yield event.plain_result(
-                "用法：/steam_search {关键词}\n"
-                "支持中英文关键词，如 /steam_search Dark Souls 或 /steam_search 怪物猎人"
-            )
+            yield event.plain_result("用法：/steam {名称或 AppID}，简写 /st {内容}")
             return
+        # 旧指令以名称搜索优先；数字无结果时也尝试 AppID 后再补搜。
+        fallback_appid = int(arg) if search_mode(arg) != "name" else None
+        async for result in self._search_by_name(event, arg, fallback_appid=fallback_appid):
+            yield result
 
-        keyword = arg[:100]  # 截断超长关键词
+    async def _search_by_name(
+        self, event: AstrMessageEvent, keyword: str,
+        fallback_appid: int | None = None,
+        review_lang: str | None = None,
+    ):
+        keyword = keyword[:100]
+        selected_review_lang = review_lang
         max_results = self._search_max_results()
-        enhanced = self._enhanced_search_enabled()
 
-        # ── 方案 B：Steam /search/suggest ──
-        results: list[dict] = []
+        # Steam 的名称本地化受 l 参数影响；无论价格地区或详情语言如何配置，
+        # 面向简中用户的名称检索始终使用简体中文。
         try:
-            results = await self._client.search_suggest(keyword, self._cc(), self._lang())
+            results = await self._client.search_suggest(keyword, self._cc(), "schinese")
         except SteamAPIError as e:
             logger.warning(f"[steam] 搜索 suggest 失败: {e}")
-
-        # 过滤非游戏内容（DLC、原声带、视频等），仅保留游戏
-        if self._search_game_only():
-            results = [r for r in results if r.get("type") == "game"]
-
-        # 限制结果数量（不再回退 /search/results/，因其会返回无关推荐游戏）
-        results = results[:max_results]
-
-        # ── 增强搜索关闭：纯 Steam 搜索，无 LLM、无 ITAD ──
-        if not enhanced:
-            if results:
-                async for r in self._send_search_results(event, results, keyword):
-                    yield r
-            else:
-                yield event.plain_result(f"🔍 搜索「{keyword}」未找到相关游戏")
+            yield event.plain_result(f"❌ Steam 名称搜索失败：{e}")
             return
 
-        # ── 以下为增强搜索流程（需要 LLM + ITAD）──
-
-        # ── LLM 校验 #1 ──
+        results = results[:max_results]
+        if self._search_game_only():
+            results = await self._filter_search_games(results)
         if results:
-            validation = await self._llm_validate_search(keyword, results)
-            match_level = validation["match_level"]
-            matched_indices = validation["matched_indices"]
-            is_single_precise = validation["is_single_precise"]
+            async for result in self._send_search_results(event, results, keyword):
+                yield result
+            return
 
-            if match_level == "high" and is_single_precise and len(matched_indices) == 1:
-                # 精准匹配 → 直出完整游戏信息
-                precise_appid = results[matched_indices[0]]["appid"]
-                logger.info(f"[steam] 搜索精准匹配 AppID {precise_appid}，直出完整信息")
-                game, cc = await self._query_with_fallback(
-                    precise_appid, self._cc(), self._lang(),
-                    review_lang=self._review_lang(event.unified_msg_origin),
-                )
-                if not game.error:
-                    if game.short_description:
-                        max_len = self._max_desc()
-                        if len(game.short_description) > max_len:
-                            game.short_description = game.short_description[:max_len] + "..."
-                    text, image_url = formatter.format_game_info(game, cc)
-                    result = event.make_result().message(text)
-                    if image_url:
-                        result = result.url_image(image_url)
-                    yield result
-                    return
-                # appdetails 查询失败，回退到搜索卡片
-                logger.warning(f"[steam] 精准匹配 AppID {precise_appid} 查询失败，回退搜索卡片")
+        if fallback_appid is not None:
+            selected_review_lang = selected_review_lang or self._review_lang(event.unified_msg_origin)
+            game, cc = await self._query_with_fallback(
+                fallback_appid, self._cc(), self._lang(),
+                review_lang=selected_review_lang,
+            )
+            if not game.error:
+                if game.short_description:
+                    max_len = self._max_desc()
+                    if len(game.short_description) > max_len:
+                        game.short_description = game.short_description[:max_len] + "..."
+                text, image_url = self._format_game_info(game, cc)
+                yield await self._result_with_cover(event, text, image_url)
+                return
+            if not is_missing_appid_error(game.error):
+                text, _ = self._format_game_info(game, cc)
+                yield event.plain_result(text)
+                return
 
-            if match_level == "high":
-                # 多条匹配（系列续作等）→ 输出搜索卡片
-                filtered = [results[i] for i in matched_indices if i < len(results)]
-                if filtered:
-                    async for r in self._send_search_results(event, filtered, keyword):
-                        yield r
-                    return
-
-            # LLM 判定匹配度低 → 进入 ITAD 增强搜索
-        else:
-            # Steam 无结果 → 进入 ITAD 增强搜索
-            pass
+        # 名称与可用的 AppID 直查都确认无结果后，才启用增强补搜。
+        if not self._enhanced_search_enabled():
+            yield event.plain_result(f"🔍 搜索「{keyword}」未找到相关游戏")
+            return
 
         # 增强搜索：LLM 翻译中文 → ITAD 搜索
         search_keyword = keyword
@@ -974,12 +1015,7 @@ class SteamStoreSniperPlugin(Star):
                 logger.warning(f"[steam] ITAD 搜索失败: {type(e).__name__}: {e}")
 
         if not itad_results:
-            if results:
-                # ITAD 也无结果，但 Steam 有结果，展示 Steam 结果
-                async for r in self._send_search_results(event, results, keyword):
-                    yield r
-            else:
-                yield event.plain_result(f"🔍 搜索「{keyword}」未找到相关游戏")
+            yield event.plain_result(f"🔍 搜索「{keyword}」未找到相关游戏")
             return
 
         # ITAD 结果需要补充 AppID（从 ITAD info 获取）和价格信息（从 Steam 获取）
@@ -1023,7 +1059,11 @@ class SteamStoreSniperPlugin(Star):
                 "image_url": item.get("image_url", ""),
             })
 
-        # ── LLM 校验 #2（ITAD 结果）──
+        if not enriched_itad:
+            yield event.plain_result(f"🔍 搜索「{keyword}」未找到相关游戏")
+            return
+
+        # ── LLM 校验（仅增强补搜结果）──
         validation2 = await self._llm_validate_search(keyword, enriched_itad)
         match_level2 = validation2["match_level"]
         matched_indices2 = validation2["matched_indices"]
@@ -1035,18 +1075,15 @@ class SteamStoreSniperPlugin(Star):
                 logger.info(f"[steam] ITAD 搜索精准匹配 AppID {precise_appid}，直出完整信息")
                 game, cc = await self._query_with_fallback(
                     precise_appid, self._cc(), self._lang(),
-                    review_lang=self._review_lang(event.unified_msg_origin),
+                    review_lang=selected_review_lang or self._review_lang(event.unified_msg_origin),
                 )
                 if not game.error:
                     if game.short_description:
                         max_len = self._max_desc()
                         if len(game.short_description) > max_len:
                             game.short_description = game.short_description[:max_len] + "..."
-                    text, image_url = formatter.format_game_info(game, cc)
-                    result = event.make_result().message(text)
-                    if image_url:
-                        result = result.url_image(image_url)
-                    yield result
+                    text, image_url = self._format_game_info(game, cc)
+                    yield await self._result_with_cover(event, text, image_url)
                     return
                 logger.warning(f"[steam] ITAD 精准匹配 AppID {precise_appid} 查询失败，回退搜索卡片")
 
@@ -1165,11 +1202,8 @@ class SteamStoreSniperPlugin(Star):
             if len(game.short_description) > max_len:
                 game.short_description = game.short_description[:max_len] + "..."
 
-        text, image_url = formatter.format_game_info(game, cc)
-        result = event.make_result().message(text)
-        if image_url:
-            result = result.url_image(image_url)
-        yield result
+        text, image_url = self._format_game_info(game, cc)
+        yield await self._result_with_cover(event, text, image_url)
 
     # ------------------------------------------------------------------
     # 愿望单辅助方法

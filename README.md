@@ -3,7 +3,7 @@
 <p align="center">
   <b>🎮 AstrBot Steam 雷达插件</b><br>
   一款基于Astrbot平台，功能强大的Steam 全能助手：涵盖游戏详情查询、价格、查看预览图、游戏搜索、群内URL自动解析。<br>
-  以上基础功能均提供多地区选择，无需登录任何账号，开箱即用。<br>
+  价格查询支持多地区；名称搜索固定使用简体中文，地区切换不会改变搜索语言。无需登录 Steam 账号。<br>
   可选接入 IsThereAnyDeal，开启增强模式，解锁增强检索、群愿望单、发售/史低自动通知、Steam 史低、订阅服务（Game Pass / EA Play 等）、集换卡牌信息等等高级功能。<br>
   群愿望单支持功能自动隔离群聊、智能分层刷新、自动向添加愿望单用户发送发售/史低通知。
 </p>
@@ -23,15 +23,15 @@
 
 | 功能 | 说明 |
 |---|---|
-| 游戏详情查询 | 输入 `/steam {appid}` 查询；发送商店链接可在开启自动解析后直接触发查询 |
+| 游戏详情查询 | 输入 `/steam {名称}` 搜索，或输入 `/steam {AppID}` 查看详情；开启自动解析后也可发送商店链接 |
 | 多地区价格查询 | `/steam_price {appid 或商店链接} {地区}` 实时查询价格及折扣 |
 | 当前在线人数 | 实时显示该游戏当前 Steam 在线人数 |
 | 评测语言区筛选 | 支持按简中 / 繁中 / 日语 / 英语 / 全部 分区统计好评率 |
 | 临时评测语言区切换 | `/steam_rlang` 为下一次查询设置评测统计语言，`/steam {appid} {语言代码}` 也可内联指定 |
 | URL 自动解析 | 白名单会话中发送 Steam 商店链接即自动触发查询，无需输入指令 |
-| 游戏搜索 | `/steam_search {关键词}` 搜索 Steam 游戏，支持中英文，精准匹配时直接输出完整游戏信息 |
-| 增强搜索（可选） | 开启 `enhanced_search` 后，Steam 搜索匹配度低时自动调用 ITAD 补充搜索，并通过插件自有 LLM 支持中文关键词翻译和结果校验（需配置 `llm_api_url` + `llm_api_key`） |
-| 游戏截图查询 | `/steam_shots` 发送压缩拼接长图，默认全局屏蔽 R18，可由管理员通过 `/steam_adult on/off` 按会话切换豁免，QQ 平台触发风控时回退文本提示 |
+| 游戏搜索 | `/steam`（简写 `/st`）统一处理名称和 AppID；名称搜索固定使用简体中文，与商店地区和详情语言设置无关 |
+| 增强搜索（可选） | Steam 名称搜索和适用的 AppID 查询确认无结果后，才调用 ITAD 补搜；配置 LLM 后可翻译中文关键词并校验补搜结果 |
+| 游戏截图查询 | `/steam_shots` 发送压缩拼接长图；R18 截图默认放行，可由管理员通过 `/sta on/off` 按会话设置屏蔽名单；QQ 平台触发风控时回退文本提示 |
 | 群愿望单 | `/wish_add` 添加、`/wish` 查询、`/wish_remove` 移除；跨群共享游戏缓存，智能分层刷新，发售/史低自动通知（需配置 `itad_api_key`） |
 | 访问控制（ACL） | 支持白名单 / 黑名单 / 关闭三种模式，按 UMO 精确控制使用权限 |
 
@@ -87,7 +87,7 @@ Pillow>=10.0.0    # 截图功能图像处理（/steam_shots 指令）
 | 配置项 | 必填 | 说明 |
 |---|---|---|
 | **默认地区** (`default_cc`) | 推荐 | 查询价格时的默认地区，如 `hk`、`us`、`cn` |
-| **代理地址** (`proxy`) | 推荐 | 国内用户必须配置，如 `http://127.0.0.1:7890` |
+| **代理地址** (`proxy`) | 按需 | 无法直连 Steam 时填写可用代理，如 `http://127.0.0.1:7890`；封面图下载也使用该代理 |
 | **ITAD API Key** (`itad_api_key`) | 可选 | 启用史低、订阅、卡牌、社区标签等增强功能 |
 | 访问控制模式 (`acl_mode`) | 可选 | `Off` / `Whitelist` / `Blacklist`，默认关闭 |
 | URL 自动解析 (`auto_parse_enabled`) | 可选 | 开启后在授权会话中发送链接自动触发查询 |
@@ -102,14 +102,26 @@ Pillow>=10.0.0    # 截图功能图像处理（/steam_shots 指令）
 
 | 指令 | 说明 |
 |---|---|
-| `/steam {appid}` | 通过 AppID 查询游戏详情 |
+| `/steam {名称或 AppID}`（短写 `/st`） | 名称搜索或 AppID 查询；数字输入按下方规则分流 |
 | `/steam {appid} {语言代码}` | 查询时临时指定本次评测语言区 |
 | `/steam` 或 `/steam help` | 显示快速帮助（支持的命令和用法） |
-| `/steam_price {appid 或商店链接} {地区}` | 指定地区查询价格，如 `/steam_price 730 us` |
-| `/steam_search {关键词}` | 搜索 Steam 游戏（支持中英文关键词） |
-| `#N`（如 `#1`、`#2`） | 从上次搜索结果中选择指定序号的游戏查看详情（2 分钟内有效，按用户隔离） |
-| `/steam_shots {appid 或商店链接}` | 查询游戏截图长图（最多 N 张，WebUI 可配置） |
+| `/stp {appid 或商店链接} {地区}` | 指定地区查询价格，如 `/stp 730 us` |
+| `/steam_search {关键词}` | 旧版兼容指令，仍可使用 |
+| `#N`（如 `#1`、`#2`） | 搜索返回多条结果时，选择指定序号查看详情（2 分钟内有效，按用户隔离） |
+| `/sts {appid 或商店链接}` | 查询游戏截图长图（最多 N 张，WebUI 可配置） |
 | 直接发送 Steam 商店链接 | 开启 `auto_parse_enabled` 且通过 ACL 时自动解析 |
+
+### 统一搜索规则
+
+| `/steam` 或 `/st` 的输入 | 处理顺序 |
+|---|---|
+| 含非数字字符，如 `/st 救生员狂热` | 用简体中文语言参数搜索 Steam 游戏名；无游戏结果时才考虑增强补搜 |
+| 1–3 位纯数字，如 `/st 12` | 先按名称搜索，不使用 AI；无游戏结果再查 AppID，仍无结果才考虑增强补搜 |
+| 4 位及以上纯数字，如 `/st 4090260` | 先查 AppID；只有确认该 AppID 不存在或当前地区不可见时，才按名称搜索；最后才考虑增强补搜 |
+
+`default_cc` 控制价格地区，`default_lang` 控制详情显示语言；名称搜索始终使用 Steam 的 `schinese` 语言参数。默认开启的 `search_game_only` 会根据 Steam 详情核实未标明类型的候选，过滤画册、DLC 等非游戏内容；核实接口失败时保留候选，避免漏掉游戏。增强补搜需要同时开启 `enhanced_search` 并配置 `itad_api_key`，LLM 只用于增强补搜阶段。网络或限流错误会直接返回错误提示，不当作“无结果”触发 AI。
+
+搜索结果中的封面取自 Steam 实际返回的图片地址。插件先下载封面再交给消息平台发送；封面地址失效或下载失败时，名称、AppID 和价格仍会正常发送。多条结果可用 `#N` 查看详情；只有一条结果时，可直接用显示的 AppID 查询详情，例如 `/st 4090260`。
 
 ### 群愿望单指令（需配置 `itad_api_key`）
 
@@ -131,18 +143,19 @@ Pillow>=10.0.0    # 截图功能图像处理（/steam_shots 指令）
 
 | 指令 | 说明 |
 |---|---|
-| `/steam_rlang` | 查看当前评测语言区设置与可选值 |
-| `/steam_rlang {语言代码}` | 为下一次查询临时设置评测统计语言区（一次性生效） |
-| `/steam_adult status [UMO]` | 查询 R18 截图屏蔽名单状态；省略 UMO 查当前会话，附加 UMO 查指定会话 |
-| `/steam_adult on {UMO}` | 将指定 UMO 加入 R18 截图屏蔽名单；省略 UMO 时对当前会话操作 |
-| `/steam_adult off {UMO}` | 将指定 UMO 从 R18 截图屏蔽名单中移除；省略 UMO 时对当前会话操作 |
+| `/str` | 查看当前评测语言区设置与可选值 |
+| `/str {语言代码}` | 为下一次查询临时设置评测统计语言区（一次性生效） |
+| `/sta status [UMO]` | 查询 R18 截图屏蔽名单状态；省略 UMO 查当前会话，附加 UMO 查指定会话 |
+| `/sta on {UMO}` | 将指定 UMO 加入 R18 截图屏蔽名单；省略 UMO 时对当前会话操作 |
+| `/sta off {UMO}` | 将指定 UMO 从 R18 截图屏蔽名单中移除；省略 UMO 时对当前会话操作 |
 
 **说明**：
 - 评测语言代码：`schinese`（简体中文区）/ `tchinese`（繁体中文区）/ `japanese`（日语区）/ `english`（英语区）/ `all`（全部语言）
-- `/steam` 指令本身只接收 AppID；商店链接由自动解析处理器负责
-- `/steam_price` 与 `/steam_shots` 同时支持 AppID 和商店链接
-- `/steam_rlang` 无参数时显示帮助，无参数发送查询后自动消费（一次性）
-- `/steam_adult` 无参数时默认为 `status` 且作用于当前会话；可附加 UMO 参数远程管理任意会话，变更写回 WebUI 配置
+- `/steam` 可接收名称或 AppID；商店链接由自动解析处理器负责。1–3 位数字先搜名称再查 AppID；4 位及以上数字先查 AppID 再搜名称；其他输入只搜名称。只有直接查询均无结果才启用增强补搜
+- `/stp` 与 `/sts` 同时支持 AppID 和商店链接；旧指令 `/steam_price`、`/steam_shots` 仍可使用
+- `/str`（旧名 `/steam_rlang`）无参数时显示帮助，无参数发送查询后自动消费（一次性）
+- `/sta`（旧名 `/steam_adult`）无参数时默认为 `status` 且作用于当前会话；可附加 UMO 参数远程管理任意会话，变更写回 WebUI 配置
+- Steam 明确返回年龄限制时，截图屏蔽提示展示实际年龄（如 18+）；仅成人内容描述符命中、年龄字段为 0 时，提示“按 18+ 规则屏蔽”，不将 0 误写成年龄限制
 - 获取会话 UMO：向机器人发送 `/sid`，即可查看当前会话的唯一标识符
 
 **商店链接支持格式示例**：
@@ -157,6 +170,10 @@ https://store.steampowered.com/app/2989760/_/
 
 ![示例](sample/Snipaste_2026-04-24_02-05-43.png)
 
+### 简约版
+
+在 WebUI 将 `output_preset` 设为 `simple`，详情消息仅显示游戏名、当前价格、Steam 史低、评价及封面图。史低需要配置 `itad_api_key`；缺少史低或评价数据时显示“暂无数据”。封面图无法下载时仍发送文字信息。
+
 ---
 
 ## WebUI 配置项
@@ -164,17 +181,19 @@ https://store.steampowered.com/app/2989760/_/
 | 配置项 | 类型 | 默认值 | 说明 |
 |---|---|---|---|
 | `default_cc` | 字符串 | `hk` | 默认查询地区（hk / cn / us / jp / tw / sg） |
-| `default_lang` | 字符串 | `schinese` | 游戏信息显示语言 |
+| `default_lang` | 字符串 | `schinese` | 游戏详情显示语言；名称搜索固定使用简体中文，与地区无关 |
 | `review_lang` | 字符串 | `schinese` | 默认评测统计语言区 |
+| `output_preset` | 字符串 | `full` | `full` 完整版，`simple` 简约版（游戏名、价格、史低、评价、封面图） |
 | `request_timeout` | 整数 | `10` | 请求超时秒数（5–30） |
 | `rate_limit_per_minute` | 整数 | `4` | 全局查询频率上限（次/分钟），0 = 不限制 |
-| `proxy` | 字符串 | `http://127.0.0.1:7897` | 代理地址，留空禁用 |
+| `proxy` | 字符串 | `http://127.0.0.1:7897` | 代理地址；留空时尝试环境变量代理，未设置则直连 |
 | `itad_api_key` | 字符串 | — | IsThereAnyDeal API Key，留空禁用 ITAD 增强功能和群愿望单 |
-| `enhanced_search` | 布尔 | `false` | 启用增强搜索（ITAD）。开启后，当 Steam 官方搜索结果匹配度较低时，自动调用 ITAD 搜索接口进行补充搜索，并调用插件自有 LLM 支持中文关键词搜索和结果校验。需要配置 `itad_api_key` 和 LLM 相关配置才能完全生效 |
+| `enhanced_search` | 布尔 | `false` | 直接名称搜索和适用的 AppID 查询都无结果后启用 ITAD 补搜；配置 LLM 后可翻译中文关键词并校验结果 |
 | `llm_api_url` | 字符串 | — | OpenAI 兼容的 LLM API 地址（如 `https://api.openai.com/v1/chat/completions`）。留空则禁用 LLM 功能 |
 | `llm_api_key` | 字符串 | — | LLM API Key。留空则禁用 LLM 功能 |
 | `llm_model` | 字符串 | `gpt-3.5-turbo` | LLM 模型名称 |
-| `search_max_results` | 整数 | `5` | `/steam_search` 每次最多显示的搜索结果条数（1–10） |
+| `search_game_only` | 布尔 | `true` | 核实并过滤非游戏候选；核实失败时保留候选，避免漏掉游戏 |
+| `search_max_results` | 整数 | `5` | `/steam` 每次最多展示的候选数（1–10） |
 | `max_description_length` | 整数 | `200` | 简介最大字符数，0 = 不截断 |
 | `acl_mode` | 字符串 | `Off` | 访问控制模式：`Off` / `Whitelist` / `Blacklist` |
 | `allowed_list` | 列表 | — | Whitelist 模式下允许使用的 UMO 列表 |
@@ -207,6 +226,7 @@ https://store.steampowered.com/app/2989760/_/
 
 ## 数据来源
 
+- 游戏名称搜索：Steam 商店的 `/search/suggest` 响应；解析其中的本地化名称、AppID、价格及封面地址
 - 游戏详情：[Steam Store API `appdetails`](https://store.steampowered.com/api/appdetails)（公开接口）
 - 评测摘要：[Steam Store API `appreviews`](https://store.steampowered.com/appreviews)（公开接口）
 

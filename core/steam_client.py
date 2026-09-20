@@ -224,36 +224,51 @@ class SteamClient:
         )
         _RE_CLASS_IN_TAG = re.compile(r'class="([^"]*)"')
 
-        # 构建 appid → class 映射
+        # 图片地址以搜索响应中的真实 src 为准。Steam 的资源路径可能带哈希，
+        # 无法由 AppID 和固定文件名可靠拼接。
+        _RE_IMG_IN_ITEM = re.compile(r'<img\b[^>]*\bsrc=["\'](https?://[^"\']+)["\']', re.IGNORECASE)
         appid_class_map: dict[str, str] = {}
+        appid_image_map: dict[str, str] = {}
         for tag_match in _RE_TAG_WITH_APPID.finditer(html):
             tag_str = tag_match.group(0)
             tag_appid = tag_match.group(1)
             class_match = _RE_CLASS_IN_TAG.search(tag_str)
             if class_match:
                 appid_class_map[tag_appid] = class_match.group(1)
+            end = html.find("</a>", tag_match.end())
+            if end != -1:
+                image_match = _RE_IMG_IN_ITEM.search(html, tag_match.end(), end)
+                if image_match:
+                    appid_image_map[tag_appid] = _unescape_html(image_match.group(1))
 
         results: list[dict] = []
         for i, appid_str in enumerate(appids):
             name = names[i] if i < len(names) else "未知游戏"
             price = prices[i] if i < len(prices) else ""
 
-            # 判断类型：仅当 class 包含 'ds_game' 时视为游戏
-            class_str = appid_class_map.get(appid_str, "")
-            is_game = "ds_game" in class_str
+            # Steam 当前的建议项常只有 match/ds_collapse_flag，无法从 class 判断类型。
+            # 保留 unknown，交给上层按 appdetails.type 核实，避免把所有游戏误删。
+            classes = set(appid_class_map.get(appid_str, "").split())
+            if "ds_game" in classes:
+                item_type = "game"
+            elif classes & {"ds_dlc", "ds_soundtrack", "ds_demo", "ds_bundle"}:
+                item_type = "other"
+            else:
+                item_type = "unknown"
 
             results.append({
                 "appid": int(appid_str),
                 "name": _unescape_html(name),
                 "price": _unescape_html(price),
-                "image_url": f"https://shared.akamai.steamstatic.com/store_item_assets/steam/apps/{appid_str}/capsule_231x87.jpg",
-                "type": "game" if is_game else "other"
+                "image_url": appid_image_map.get(appid_str, ""),
+                "type": item_type,
             })
 
         logger.debug(
             f"[steam_client] 搜索 suggest 返回 {len(results)} 条结果 "
             f"(game={sum(1 for r in results if r['type'] == 'game')}, "
-            f"other={sum(1 for r in results if r['type'] != 'game')})"
+            f"unknown={sum(1 for r in results if r['type'] == 'unknown')}, "
+            f"other={sum(1 for r in results if r['type'] == 'other')})"
         )
         return results
 
